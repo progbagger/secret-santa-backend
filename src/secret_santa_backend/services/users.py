@@ -1,8 +1,8 @@
 from secret_santa_backend.entities import RegistrationResult
-from secret_santa_backend.repositories.postgres import PostgresDatabase
-from secret_santa_backend.repositories.postgres import register_user as persist_user
+from secret_santa_backend.repositories.postgres import transaction
+from secret_santa_backend.repositories.postgres.users import register_user as persist_user
 
 
-async def register_user(database: PostgresDatabase, login: str) -> RegistrationResult:
-    async with database.transaction():
+async def register_user(login: str) -> RegistrationResult:
+    async with transaction():
         return await persist_user(login)

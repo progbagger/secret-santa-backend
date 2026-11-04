@@ -1,5 +1,5 @@
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 
 from sqlalchemy import text
@@ -49,3 +49,33 @@ class PostgresDatabase:
 
     async def close(self) -> None:
         await self._engine.dispose()
+
+
+_current_database: ContextVar[PostgresDatabase | None] = ContextVar("postgres_database", default=None)
+
+
+class PostgresDatabaseUnavailableError(RuntimeError):
+    """Raised when no database is bound to the current application context."""
+
+
+def get_database() -> PostgresDatabase:
+    database = _current_database.get()
+    if database is None:
+        raise PostgresDatabaseUnavailableError("PostgreSQL database is only available inside use_database()")
+
+    return database
+
+
+@contextmanager
+def use_database(database: PostgresDatabase) -> Iterator[None]:
+    token = _current_database.set(database)
+    try:
+        yield
+    finally:
+        _current_database.reset(token)
+
+
+@asynccontextmanager
+async def transaction() -> AsyncIterator[None]:
+    async with get_database().transaction():
+        yield

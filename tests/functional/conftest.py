@@ -47,9 +47,9 @@ class BackendEnvironment:
         self._run_compose("up", "-d", "postgres")
         self._wait_for_postgres()
 
-    def migrate(self) -> None:
+    def migrate(self, revision: str = "head") -> None:
         result = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            [sys.executable, "-m", "alembic", "upgrade", revision],
             cwd=ROOT,
             env={**os.environ, "DATABASE_URL": self.database_url},
             capture_output=True,

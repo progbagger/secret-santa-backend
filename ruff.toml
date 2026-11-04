@@ -2,4 +2,4 @@ fix = true
 line-length = 120
 
 [lint]
-select = ["E", "F", "B", "I", "UP", "SIM"]
+select = ["E", "F", "B", "I", "UP", "SIM", "FBT001", "FBT002"]

@@ -17,11 +17,33 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql
 
+  token-issuer:
+    build:
+      context: .
+    command: ["uvicorn", "secret_santa_backend.token_issuer:create_app", "--factory", "--host", "0.0.0.0"]
+    environment:
+      TOKEN_BOT_CLIENT_SECRET: ${TOKEN_BOT_CLIENT_SECRET:-}
+      TOKEN_BACKEND_CLIENT_SECRET: ${TOKEN_BACKEND_CLIENT_SECRET:-}
+      TOKEN_TTL_SECONDS: ${TOKEN_TTL_SECONDS:-900}
+    ports:
+      - "127.0.0.1:${TOKEN_ISSUER_PORT:-8001}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   backend:
     build:
       context: .
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-secret_santa}:${POSTGRES_PASSWORD:-secret_santa}@postgres:5432/${POSTGRES_DB:-secret_santa}
+      TOKEN_ISSUER_URL: ${TOKEN_ISSUER_URL:-http://token-issuer:8000}
+      TOKEN_BACKEND_CLIENT_SECRET: ${TOKEN_BACKEND_CLIENT_SECRET:-}
       BACKEND_HOST: 0.0.0.0
       BACKEND_PORT: 8000
     command:
@@ -30,6 +52,8 @@ services:
       - alembic upgrade head && exec secret-santa-backend
     depends_on:
       postgres:
+        condition: service_healthy
+      token-issuer:
         condition: service_healthy
     ports:
       - "${BACKEND_PORT:-8000}:8000"

@@ -6,30 +6,57 @@ import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO
 from uuid import uuid4
 
+import aiohttp
 import asyncpg
-import httpx
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = ROOT / "compose.yml"
+TOKEN_ENV = {
+    "TOKEN_BOT_CLIENT_SECRET": "test-bot-secret-not-for-production",
+    "TOKEN_BACKEND_CLIENT_SECRET": "test-backend-secret-not-for-production",
+    "TOKEN_TTL_SECONDS": "900",
+}
 
 
 @dataclass(slots=True)
 class BackendEnvironment:
     work_directory: Path
     postgres_port: int = field(default_factory=lambda: _free_port())
+    issuer_port: int = field(default_factory=lambda: _free_port())
     backend_port: int = field(default_factory=lambda: _free_port())
     project_name: str = field(default_factory=lambda: f"ss-test-{uuid4().hex[:10]}")
     process: subprocess.Popen[bytes] | None = None
+    issuer_process: subprocess.Popen[bytes] | None = None
+    authorization: dict[str, str] = field(default_factory=dict)
     _log_file: IO[bytes] | None = None
 
     @property
     def api_url(self) -> str:
         return f"http://127.0.0.1:{self.backend_port}"
+
+    @property
+    def issuer_url(self) -> str:
+        return f"http://127.0.0.1:{self.issuer_port}"
+
+    async def request_token(
+        self, *, role: str = "bot", secret: str = TOKEN_ENV["TOKEN_BOT_CLIENT_SECRET"]
+    ) -> aiohttp.ClientResponse:
+        async with (
+            aiohttp.ClientSession(base_url=self.issuer_url) as client,
+            client.post(
+                "/token",
+                headers={"Authorization": aiohttp.encode_basic_auth(role, secret)},
+                data={"grant_type": "client_credentials"},
+            ) as response,
+        ):
+            await response.read()
+            return response
 
     @property
     def database_url(self) -> str:
@@ -41,7 +68,14 @@ class BackendEnvironment:
 
     def start_stack(self) -> None:
         self._run_compose("up", "-d", "--build", "backend")
-        self.wait_for_http("/health/ready", expected_status=200, timeout=90)
+        asyncio.run(self._wait_for_stack())
+
+    async def _wait_for_stack(self) -> None:
+        await self.wait_for_http("/health/ready", expected_status=200, timeout=90)
+        response = await self.request_token()
+        response.raise_for_status()
+        token = (await response.json())["access_token"]
+        self.authorization = {"Authorization": f"Bearer {token}"}
 
     def start_postgres(self) -> None:
         self._run_compose("up", "-d", "postgres")
@@ -62,6 +96,32 @@ class BackendEnvironment:
                 f"stderr:\n{result.stderr.decode(errors='replace')}"
             )
 
+    def set_issuer_time(self, now: datetime) -> None:
+        clock_file = self.work_directory / "issuer-clock"
+        pending = clock_file.with_suffix(".tmp")
+        pending.write_text(now.isoformat())
+        pending.replace(clock_file)
+
+    def start_local_issuer(self) -> None:
+        clock_file = self.work_directory / "issuer-clock"
+        if not clock_file.exists():
+            self.set_issuer_time(datetime.now(UTC))
+
+        with (self.work_directory / "issuer.log").open("wb") as output:
+            self.issuer_process = subprocess.Popen(
+                [sys.executable, "-m", "tests.functional.run_token_issuer", str(self.issuer_port), str(clock_file)],
+                cwd=ROOT,
+                env={**os.environ, **TOKEN_ENV},
+                stdout=output,
+                stderr=subprocess.STDOUT,
+            )
+        asyncio.run(self.wait_for_http("/health/ready", expected_status=200, timeout=20, issuer=True))
+
+    def stop_local_issuer(self) -> None:
+        if self.issuer_process is not None:
+            _stop_process(self.issuer_process)
+            self.issuer_process = None
+
     def start_local_backend(self) -> None:
         log_path = self.work_directory / "backend.log"
         self._log_file = log_path.open("w+b")
@@ -71,6 +131,8 @@ class BackendEnvironment:
             env={
                 **os.environ,
                 "DATABASE_URL": self.database_url,
+                "TOKEN_ISSUER_URL": self.issuer_url,
+                **TOKEN_ENV,
                 "BACKEND_HOST": "127.0.0.1",
                 "BACKEND_PORT": str(self.backend_port),
                 "PYTHONUNBUFFERED": "1",
@@ -78,40 +140,43 @@ class BackendEnvironment:
             stdout=self._log_file,
             stderr=subprocess.STDOUT,
         )
-        self.wait_for_http("/health/live", expected_status=200, timeout=20)
+        asyncio.run(self.wait_for_http("/health/live", expected_status=200, timeout=20))
 
-    def wait_for_http(self, path: str, *, expected_status: int, timeout: float) -> httpx.Response:
+    async def wait_for_http(
+        self, path: str, *, expected_status: int, timeout: float, issuer: bool = False
+    ) -> aiohttp.ClientResponse:
         deadline = time.monotonic() + timeout
         last_error: Exception | None = None
 
-        with httpx.Client(timeout=1) as client:
+        base_url = self.issuer_url if issuer else self.api_url
+        process = self.issuer_process if issuer else self.process
+        async with aiohttp.ClientSession(base_url=base_url, timeout=aiohttp.ClientTimeout(total=1)) as client:
             while time.monotonic() < deadline:
-                if self.process is not None and self.process.poll() is not None:
-                    raise RuntimeError(f"Backend exited unexpectedly:\n{self._read_backend_log()}")
+                if process is not None and process.poll() is not None:
+                    log = self._read_issuer_log() if issuer else self._read_backend_log()
+                    raise RuntimeError(f"Server exited unexpectedly:\n{log}")
 
                 try:
-                    response = client.get(f"{self.api_url}{path}")
-                    if response.status_code == expected_status:
-                        return response
-                except httpx.HTTPError as error:
+                    async with client.get(path) as response:
+                        if response.status == expected_status:
+                            await response.read()
+                            return response
+                except (aiohttp.ClientError, TimeoutError) as error:
                     last_error = error
 
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
 
         diagnostics = self._compose_logs()
         raise RuntimeError(
             f"Timed out waiting for {path} to return {expected_status}; last_error={last_error!r}\n"
-            f"backend log:\n{self._read_backend_log()}\ncompose logs:\n{diagnostics}"
+            f"backend log:\n{self._read_backend_log()}\nissuer log:\n{self._read_issuer_log()}\n"
+            f"compose logs:\n{diagnostics}"
         )
 
     def close(self) -> None:
         if self.process is not None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+            _stop_process(self.process)
+        self.stop_local_issuer()
 
         if self._log_file is not None:
             self._log_file.close()
@@ -142,6 +207,9 @@ class BackendEnvironment:
             cwd=ROOT,
             env={
                 **os.environ,
+                **TOKEN_ENV,
+                "TOKEN_ISSUER_URL": "http://token-issuer:8000",
+                "TOKEN_ISSUER_PORT": str(self.issuer_port),
                 "POSTGRES_PORT": str(self.postgres_port),
                 "BACKEND_PORT": str(self.backend_port),
             },
@@ -163,6 +231,10 @@ class BackendEnvironment:
             return ""
         return log_path.read_text(errors="replace")
 
+    def _read_issuer_log(self) -> str:
+        log_path = self.work_directory / "issuer.log"
+        return log_path.read_text(errors="replace") if log_path.exists() else ""
+
     def _compose_logs(self) -> str:
         result = self._run_compose("logs", "--no-color", check=False)
         return (result.stdout + result.stderr).decode(errors="replace")
@@ -182,10 +254,20 @@ def running_backend(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Backen
 def backend_without_postgres(tmp_path: Path) -> Iterator[BackendEnvironment]:
     environment = BackendEnvironment(tmp_path)
     try:
+        environment.start_local_issuer()
         environment.start_local_backend()
         yield environment
     finally:
         environment.close()
+
+
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
 
 
 def _free_port() -> int:

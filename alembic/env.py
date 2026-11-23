@@ -6,7 +6,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
-from secret_santa_backend.config import Settings
+from secret_santa_backend.config import database_url_from_environment
 from secret_santa_backend.repositories.postgres.schema import metadata
 
 config = context.config
@@ -14,7 +14,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", Settings.from_environment().database_url)
+config.set_main_option("sqlalchemy.url", database_url_from_environment())
 target_metadata = metadata
 
 

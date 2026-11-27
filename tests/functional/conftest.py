@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO
+from typing import IO, Literal
 from uuid import uuid4
 
 import aiohttp
@@ -81,9 +81,9 @@ class BackendEnvironment:
         self._run_compose("up", "-d", "postgres")
         self._wait_for_postgres()
 
-    def migrate(self, revision: str = "head") -> None:
+    def migrate(self, revision: str = "head", *, direction: Literal["upgrade", "downgrade"] = "upgrade") -> None:
         result = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", revision],
+            [sys.executable, "-m", "alembic", direction, revision],
             cwd=ROOT,
             env={**os.environ, "DATABASE_URL": self.database_url},
             capture_output=True,

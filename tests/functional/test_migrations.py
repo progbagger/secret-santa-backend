@@ -1,4 +1,6 @@
+import asyncio
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -31,7 +33,7 @@ async def test_alembic_upgrade_creates_users_schema(running_backend: BackendEnvi
     finally:
         await connection.close()
 
-    assert_that(revision, equal_to("0002"))
+    assert_that(revision, equal_to("0003"))
     assert_that(
         [dict(column) for column in columns],
         equal_to(
@@ -108,7 +110,7 @@ async def test_group_migration_preserves_existing_user_and_creates_constrained_s
     try:
         original = await connection.fetchrow("INSERT INTO users (login) VALUES ('before-group-migration') RETURNING *")
 
-        legacy_database.migrate()
+        await asyncio.to_thread(legacy_database.migrate, "0002")
 
         current = await connection.fetchrow("SELECT * FROM users WHERE id = $1", original["id"])
         assert_that(dict(current), equal_to(dict(original)))
@@ -177,7 +179,7 @@ async def test_group_migration_preserves_existing_user_and_creates_constrained_s
         (None, None, asyncpg.NotNullViolationError),
     ],
 )
-async def test_group_database_rejects_invalid_values(
+async def test_game_database_rejects_invalid_values(
     *, running_backend: BackendEnvironment, name: str | None, description: str | None, error: type[Exception]
 ) -> None:
     connection = await asyncpg.connect(running_backend.asyncpg_url)
@@ -185,14 +187,117 @@ async def test_group_database_rejects_invalid_values(
         owner_id = await connection.fetchval("INSERT INTO users (login) VALUES ($1) RETURNING id", uuid4().hex)
         with pytest.raises(error):
             await connection.execute(
-                "INSERT INTO santa_groups (id, organizer_user_id, name, description) VALUES ($1, $2, $3, $4)",
+                "INSERT INTO santa_games (id, organizer_user_id, name, description) VALUES ($1, $2, $3, $4)",
                 uuid4(),
                 owner_id,
                 name,
                 description,
             )
-        assert (
-            await connection.fetchval("SELECT count(*) FROM santa_groups WHERE organizer_user_id = $1", owner_id) == 0
+        assert await connection.fetchval("SELECT count(*) FROM santa_games WHERE organizer_user_id = $1", owner_id) == 0
+    finally:
+        await connection.close()
+
+
+async def test_game_migration_preserves_groups_and_users_through_upgrade_and_downgrade(
+    legacy_database: BackendEnvironment,
+) -> None:
+    # arrange
+    await asyncio.to_thread(legacy_database.migrate, "0002")
+    connection = await asyncpg.connect(legacy_database.asyncpg_url)
+    try:
+        users = await connection.fetch("INSERT INTO users (login) VALUES ('first'), ('second') RETURNING *")
+        groups = [
+            await connection.fetchrow(
+                """
+                INSERT INTO santa_groups (id, organizer_user_id, name, description, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, '2025-11-01T00:00:00+07:00', '2025-11-15T00:00:00+07:00')
+                RETURNING *
+                """,
+                uuid4(),
+                organizer,
+                name,
+                description,
+            )
+            for organizer, name, description in (
+                (users[0]["id"], "Семья", "Подарки"),
+                (users[0]["id"], "Друзья", None),
+                (users[1]["id"], "Семья", ""),
+            )
+        ]
+        expected_groups = {row["id"]: dict(row) for row in groups}
+        expected_users = {row["id"]: dict(row) for row in users}
+
+        # act
+        await asyncio.to_thread(legacy_database.migrate)
+
+        # assert
+        assert await connection.fetchval("SELECT version_num FROM alembic_version") == "0003"
+        assert await connection.fetchval("SELECT to_regclass('santa_groups')") is None
+        assert_that(
+            {row["id"]: dict(row) for row in await connection.fetch("SELECT * FROM santa_games")},
+            equal_to({key: dict(row, starts_at=None, ends_at=None) for key, row in expected_groups.items()}),
         )
+        assert_that(
+            {row["id"]: dict(row) for row in await connection.fetch("SELECT * FROM users")}, equal_to(expected_users)
+        )
+        assert await connection.fetchval("SELECT count(*) FROM santa_game_participants") == 0
+        assert await connection.fetchval("SELECT to_regclass('ix_santa_games_organizer_user_id')") is not None
+
+        # arrange
+        game_id = groups[0]["id"]
+        await connection.execute("UPDATE santa_games SET starts_at = now() WHERE id = $1", game_id)
+        await connection.execute(
+            "INSERT INTO santa_game_participants (game_id, user_id) VALUES ($1, $2)", game_id, users[1]["id"]
+        )
+
+        # act
+        await asyncio.to_thread(legacy_database.migrate, "0002", direction="downgrade")
+
+        # assert
+        assert await connection.fetchval("SELECT version_num FROM alembic_version") == "0002"
+        assert await connection.fetchval("SELECT to_regclass('santa_games')") is None
+        assert await connection.fetchval("SELECT to_regclass('santa_game_participants')") is None
+        assert_that(
+            {row["id"]: dict(row) for row in await connection.fetch("SELECT * FROM santa_groups")},
+            equal_to(expected_groups),
+        )
+        assert_that(
+            {row["id"]: dict(row) for row in await connection.fetch("SELECT * FROM users")}, equal_to(expected_users)
+        )
+    finally:
+        await connection.close()
+
+
+async def test_game_schema_enforces_schedule_and_participant_integrity(running_backend: BackendEnvironment) -> None:
+    connection = await asyncpg.connect(running_backend.asyncpg_url)
+    try:
+        # arrange
+        organizer = await connection.fetchval("INSERT INTO users (login) VALUES ($1) RETURNING id", uuid4().hex)
+        participant = await connection.fetchval("INSERT INTO users (login) VALUES ($1) RETURNING id", uuid4().hex)
+        game_id = uuid4()
+        start = datetime.fromisoformat("2026-12-20T12:00:00+07:00")
+        same_instant = datetime.fromisoformat("2026-12-20T05:00:00Z")
+        add_participant = "INSERT INTO santa_game_participants (game_id, user_id) VALUES ($1, $2)"
+        await connection.execute(
+            "INSERT INTO santa_games (id, organizer_user_id, name, starts_at) VALUES ($1, $2, 'Семья', $3)",
+            game_id,
+            organizer,
+            start,
+        )
+        await connection.execute(add_participant, game_id, participant)
+
+        # act / assert
+        with pytest.raises(asyncpg.CheckViolationError, match="ck_santa_games_schedule"):
+            await connection.execute("UPDATE santa_games SET ends_at = $1 WHERE id = $2", same_instant, game_id)
+        with pytest.raises(asyncpg.UniqueViolationError, match="pk_santa_game_participants"):
+            await connection.execute(add_participant, game_id, participant)
+        with pytest.raises(asyncpg.ForeignKeyViolationError, match="fk_santa_game_participants_game"):
+            await connection.execute(add_participant, uuid4(), participant)
+        with pytest.raises(asyncpg.ForeignKeyViolationError, match="fk_santa_game_participants_user"):
+            await connection.execute(add_participant, game_id, 9223372036854775807)
+        with pytest.raises(asyncpg.RestrictViolationError, match="fk_santa_game_participants_user"):
+            await connection.execute("DELETE FROM users WHERE id = $1", participant)
+        with pytest.raises(asyncpg.RestrictViolationError, match="fk_santa_games_organizer"):
+            await connection.execute("DELETE FROM users WHERE id = $1", organizer)
     finally:
         await connection.close()

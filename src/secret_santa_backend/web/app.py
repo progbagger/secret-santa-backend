@@ -10,10 +10,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from secret_santa_backend.config import Settings
 from secret_santa_backend.repositories.postgres import PostgresDatabase, get_database, use_database
 from secret_santa_backend.services import register_user as register_user_service
-from secret_santa_backend.services.groups import GroupNotFoundError
+from secret_santa_backend.services.games import (
+    GameNotFoundError,
+    InvalidGameScheduleError,
+    ParticipantUserNotFoundError,
+)
 from secret_santa_backend.web.auth import BearerMiddleware, is_api_path
 from secret_santa_backend.web.entities import HealthResponse, UserRegistrationRequest, UserResponse
-from secret_santa_backend.web.groups import create_group_router
+from secret_santa_backend.web.games import create_game_router
 
 
 class AppState(TypedDict):
@@ -73,11 +77,24 @@ def create_app() -> FastAPI:
         dependencies=[Depends(bind_database)],
     )
     app.add_middleware(BearerMiddleware)
-    app.include_router(create_group_router())
+    app.include_router(create_game_router())
 
-    @app.exception_handler(GroupNotFoundError)
-    async def group_not_found(_: Request, __: GroupNotFoundError) -> JSONResponse:
-        return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"detail": "Group or organizer not found"})
+    @app.exception_handler(GameNotFoundError)
+    async def game_not_found(_: Request, __: GameNotFoundError) -> JSONResponse:
+        return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"detail": "Game or organizer not found"})
+
+    @app.exception_handler(ParticipantUserNotFoundError)
+    async def participant_user_not_found(_: Request, __: ParticipantUserNotFoundError) -> JSONResponse:
+        return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"detail": "User not found"})
+
+    @app.exception_handler(InvalidGameScheduleError)
+    async def invalid_game_schedule(_: Request, __: InvalidGameScheduleError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={
+                "detail": [{"type": "value_error", "loc": ["body"], "msg": "ends_at must be later than starts_at"}],
+            },
+        )
 
     @app.get("/health/live", operation_id="get_liveness", response_model=HealthResponse)
     async def get_liveness() -> HealthResponse:

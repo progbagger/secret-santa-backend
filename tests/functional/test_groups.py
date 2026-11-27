@@ -4,8 +4,8 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+import aiohttp
 import asyncpg
-import httpx
 import pytest
 from hamcrest import assert_that, equal_to, has_entries, has_length, none
 
@@ -13,8 +13,10 @@ from tests.functional.conftest import BackendEnvironment
 
 
 @pytest.fixture
-async def client(running_backend: BackendEnvironment) -> AsyncIterator[httpx.AsyncClient]:
-    async with httpx.AsyncClient(base_url=running_backend.api_url) as http_client:
+async def client(running_backend: BackendEnvironment) -> AsyncIterator[aiohttp.ClientSession]:
+    async with aiohttp.ClientSession(
+        base_url=running_backend.api_url, headers=running_backend.authorization
+    ) as http_client:
         yield http_client
 
 
@@ -27,20 +29,20 @@ async def connection(running_backend: BackendEnvironment) -> AsyncIterator[async
         await database_connection.close()
 
 
-async def _register_user(client: httpx.AsyncClient) -> int:
+async def _register_user(client: aiohttp.ClientSession) -> int:
     response = await client.post("/api/v1/users", json={"login": uuid4().hex})
-    assert response.status_code == 201
-    return int(response.json()["id"])
+    assert response.status == 201
+    return int((await response.json())["id"])
 
 
 @pytest.fixture
-async def created_group(client: httpx.AsyncClient) -> dict[str, Any]:
+async def created_group(client: aiohttp.ClientSession) -> dict[str, Any]:
     organizer_id = await _register_user(client)
     response = await client.post(
         f"/api/v1/users/{organizer_id}/groups", json={"name": "Семья", "description": "Подарки"}
     )
-    assert response.status_code == 201
-    return dict(response.json())
+    assert response.status == 201
+    return dict(await response.json())
 
 
 def _path(group: dict[str, Any]) -> str:
@@ -48,14 +50,19 @@ def _path(group: dict[str, Any]) -> str:
 
 
 async def test_create_group_persists_normalized_name_and_timezone_timestamps(
-    *, client: httpx.AsyncClient, connection: asyncpg.Connection
+    *, client: aiohttp.ClientSession, connection: asyncpg.Connection
 ) -> None:
+    # arrange
     organizer_id = await _register_user(client)
+
+    # act
     response = await client.post(
         f"/api/v1/users/{organizer_id}/groups", json={"name": " \tНовый год 2026\n", "description": "Семья и друзья"}
     )
-    assert response.status_code == 201
-    group = response.json()
+
+    # assert
+    assert response.status == 201
+    group = await response.json()
     group_id = UUID(group["id"])
     assert_that(group, has_entries(organizer_user_id=organizer_id, name="Новый год 2026", description="Семья и друзья"))
 
@@ -71,11 +78,14 @@ async def test_create_group_persists_normalized_name_and_timezone_timestamps(
 
 
 async def test_get_group_returns_current_representation(
-    *, client: httpx.AsyncClient, created_group: dict[str, Any]
+    *, client: aiohttp.ClientSession, created_group: dict[str, Any]
 ) -> None:
+    # act
     response = await client.get(_path(created_group))
-    assert response.status_code == 200
-    assert_that(response.json(), equal_to(created_group))
+
+    # assert
+    assert response.status == 200
+    assert_that((await response.json()), equal_to(created_group))
 
 
 @pytest.mark.parametrize(
@@ -90,15 +100,18 @@ async def test_get_group_returns_current_representation(
 )
 async def test_patch_changes_provided_fields_and_preserves_identity(
     *,
-    client: httpx.AsyncClient,
+    client: aiohttp.ClientSession,
     connection: asyncpg.Connection,
     created_group: dict[str, Any],
     payload: dict[str, object],
     expected_name: str,
     expected_description: str | None,
 ) -> None:
+    # act
     response = await client.patch(_path(created_group), json=payload)
-    assert response.status_code == 200
+
+    # assert
+    assert response.status == 200
     expected = {
         "id": created_group["id"],
         "organizer_user_id": created_group["organizer_user_id"],
@@ -106,20 +119,25 @@ async def test_patch_changes_provided_fields_and_preserves_identity(
         "name": expected_name,
         "description": expected_description,
     }
-    assert_that(response.json(), has_entries(expected))
-    assert datetime.fromisoformat(response.json()["updated_at"]) > datetime.fromisoformat(created_group["updated_at"])
+    assert_that((await response.json()), has_entries(expected))
+    assert datetime.fromisoformat((await response.json())["updated_at"]) > datetime.fromisoformat(
+        created_group["updated_at"]
+    )
     row = await connection.fetchrow("SELECT * FROM santa_groups WHERE id = $1", UUID(created_group["id"]))
     assert_that(dict(row), has_entries(name=expected_name, description=expected_description))
-    assert_that(row["updated_at"], equal_to(datetime.fromisoformat(response.json()["updated_at"])))
+    assert_that(row["updated_at"], equal_to(datetime.fromisoformat((await response.json())["updated_at"])))
 
 
 async def test_delete_removes_group_and_keeps_organizer(
-    *, client: httpx.AsyncClient, connection: asyncpg.Connection, created_group: dict[str, Any]
+    *, client: aiohttp.ClientSession, connection: asyncpg.Connection, created_group: dict[str, Any]
 ) -> None:
+    # act
     response = await client.delete(_path(created_group))
-    assert response.status_code == 204
-    assert response.content == b""
-    assert (await client.get(_path(created_group))).status_code == 404
+
+    # assert
+    assert response.status == 204
+    assert await response.read() == b""
+    assert (await client.get(_path(created_group))).status == 404
     assert_that(
         await connection.fetchrow("SELECT * FROM santa_groups WHERE id = $1", UUID(created_group["id"])), none()
     )
@@ -131,39 +149,50 @@ async def test_delete_removes_group_and_keeps_organizer(
 @pytest.mark.parametrize("payload", [{"name": "  Семья  "}, {"description": "Подарки"}, {"description": None}])
 async def test_repeated_patch_preserves_group_including_updated_at(
     *,
-    client: httpx.AsyncClient,
+    client: aiohttp.ClientSession,
     connection: asyncpg.Connection,
     created_group: dict[str, Any],
     payload: dict[str, object],
 ) -> None:
+    # act
     first = await client.patch(_path(created_group), json=payload)
     second = await client.patch(_path(created_group), json=payload)
-    assert first.status_code == second.status_code == 200
-    assert_that(second.json(), equal_to(first.json()))
+
+    # assert
+    assert first.status == second.status == 200
+    assert_that((await second.json()), equal_to(await first.json()))
     if payload.get("description", "Подарки") is not None:
-        assert_that(first.json(), equal_to(created_group))
+        assert_that((await first.json()), equal_to(created_group))
     row = await connection.fetchrow("SELECT * FROM santa_groups WHERE id = $1", UUID(created_group["id"]))
-    assert_that(row["updated_at"], equal_to(datetime.fromisoformat(first.json()["updated_at"])))
+    assert_that(row["updated_at"], equal_to(datetime.fromisoformat((await first.json())["updated_at"])))
 
 
-async def test_same_name_is_allowed_for_same_and_different_organizers(client: httpx.AsyncClient) -> None:
+async def test_same_name_is_allowed_for_same_and_different_organizers(client: aiohttp.ClientSession) -> None:
+    # arrange
     first_owner = await _register_user(client)
     second_owner = await _register_user(client)
+
+    # act
     responses = [
         await client.post(f"/api/v1/users/{owner}/groups", json={"name": "Одинаковое имя"})
         for owner in (first_owner, first_owner, second_owner)
     ]
-    assert_that([response.status_code for response in responses], equal_to([201, 201, 201]))
-    assert_that({response.json()["id"] for response in responses}, has_length(3))
-    assert_that([response.json()["description"] for response in responses], equal_to([None, None, None]))
+
+    # assert
+    assert_that([response.status for response in responses], equal_to([201, 201, 201]))
+    assert_that({(await response.json())["id"] for response in responses}, has_length(3))
+    assert_that([(await response.json())["description"] for response in responses], equal_to([None, None, None]))
 
 
 async def test_unknown_organizer_cannot_create_group(
-    *, client: httpx.AsyncClient, connection: asyncpg.Connection
+    *, client: aiohttp.ClientSession, connection: asyncpg.Connection
 ) -> None:
+    # act
     response = await client.post("/api/v1/users/9223372036854775807/groups", json={"name": "Нет владельца"})
-    assert response.status_code == 404
-    assert_that(response.json(), equal_to({"detail": "Group or organizer not found"}))
+
+    # assert
+    assert response.status == 404
+    assert_that((await response.json()), equal_to({"detail": "Group or organizer not found"}))
     assert (
         await connection.fetchval("SELECT count(*) FROM santa_groups WHERE organizer_user_id = 9223372036854775807")
         == 0
@@ -172,8 +201,9 @@ async def test_unknown_organizer_cannot_create_group(
 
 @pytest.mark.parametrize("method", ["GET", "PATCH", "DELETE"])
 async def test_other_organizer_and_missing_group_have_same_not_found_response_and_do_not_mutate_group(
-    *, client: httpx.AsyncClient, connection: asyncpg.Connection, created_group: dict[str, Any], method: str
+    *, client: aiohttp.ClientSession, connection: asyncpg.Connection, created_group: dict[str, Any], method: str
 ) -> None:
+    # arrange
     other_owner = await _register_user(client)
     original = await connection.fetchrow("SELECT * FROM santa_groups WHERE id = $1", UUID(created_group["id"]))
     paths = [
@@ -181,10 +211,14 @@ async def test_other_organizer_and_missing_group_have_same_not_found_response_an
         f"/api/v1/users/9223372036854775807/groups/{created_group['id']}",
         f"/api/v1/users/{created_group['organizer_user_id']}/groups/{uuid4()}",
     ]
+
+    # act
     for path in paths:
         response = await client.request(method, path, **({"json": {"name": "Чужая"}} if method == "PATCH" else {}))
-        assert response.status_code == 404
-        assert_that(response.json(), equal_to({"detail": "Group or organizer not found"}))
+
+        # assert
+        assert response.status == 404
+        assert_that((await response.json()), equal_to({"detail": "Group or organizer not found"}))
 
     current = await connection.fetchrow("SELECT * FROM santa_groups WHERE id = $1", UUID(created_group["id"]))
     assert_that(dict(current), equal_to(dict(original)))
@@ -214,47 +248,60 @@ async def test_other_organizer_and_missing_group_have_same_not_found_response_an
 )
 async def test_invalid_group_payload_is_rejected_without_changes(
     *,
-    client: httpx.AsyncClient,
+    client: aiohttp.ClientSession,
     connection: asyncpg.Connection,
     created_group: dict[str, Any],
     method: str,
     payload: dict[str, object],
 ) -> None:
+    # arrange
     owner_id = created_group["organizer_user_id"]
     path = f"/api/v1/users/{owner_id}/groups" if method == "POST" else _path(created_group)
+
+    # act
     response = await client.request(method, path, json=payload)
-    assert response.status_code == 422
+
+    # assert
+    assert response.status == 422
     fetched = await client.get(_path(created_group))
-    assert_that(fetched.json(), equal_to(created_group))
+    assert_that((await fetched.json()), equal_to(created_group))
     assert await connection.fetchval("SELECT count(*) FROM santa_groups WHERE organizer_user_id = $1", owner_id) == 1
 
 
 @pytest.mark.parametrize("description", ["", None, "я" * 2000])
 async def test_boundary_lengths_and_nullable_description_are_accepted(
-    *, client: httpx.AsyncClient, description: str | None
+    *, client: aiohttp.ClientSession, description: str | None
 ) -> None:
+    # arrange
     owner_id = await _register_user(client)
     name = "я" * 120
+
+    # act
     response = await client.post(
         f"/api/v1/users/{owner_id}/groups", json={"name": f" {name} ", "description": description}
     )
-    assert response.status_code == 201
-    assert_that(response.json(), has_entries(name=name, description=description))
-    patched = await client.patch(_path(response.json()), json={"name": name, "description": description})
-    assert patched.status_code == 200
-    assert_that(patched.json(), equal_to(response.json()))
+
+    # assert
+    assert response.status == 201
+    assert_that((await response.json()), has_entries(name=name, description=description))
+    patched = await client.patch(_path(await response.json()), json={"name": name, "description": description})
+    assert patched.status == 200
+    assert_that((await patched.json()), equal_to(await response.json()))
 
 
 async def test_concurrent_partial_patches_keep_both_fields(
-    *, client: httpx.AsyncClient, connection: asyncpg.Connection, created_group: dict[str, Any]
+    *, client: aiohttp.ClientSession, connection: asyncpg.Connection, created_group: dict[str, Any]
 ) -> None:
+    # act
     responses = await asyncio.gather(
         client.patch(_path(created_group), json={"name": "Новое имя"}),
         client.patch(_path(created_group), json={"description": "Новое описание"}),
     )
-    assert_that([response.status_code for response in responses], equal_to([200, 200]))
+
+    # assert
+    assert_that([response.status for response in responses], equal_to([200, 200]))
     fetched = await client.get(_path(created_group))
-    assert_that(fetched.json(), has_entries(name="Новое имя", description="Новое описание"))
+    assert_that((await fetched.json()), has_entries(name="Новое имя", description="Новое описание"))
     row = await connection.fetchrow(
         "SELECT name, description FROM santa_groups WHERE id = $1", UUID(created_group["id"])
     )
@@ -262,21 +309,31 @@ async def test_concurrent_partial_patches_keep_both_fields(
 
 
 async def test_repeated_delete_does_not_change_another_group(
-    *, client: httpx.AsyncClient, created_group: dict[str, Any]
+    *, client: aiohttp.ClientSession, created_group: dict[str, Any]
 ) -> None:
+    # arrange
     sibling = await client.post(f"/api/v1/users/{created_group['organizer_user_id']}/groups", json={"name": "Соседняя"})
-    assert sibling.status_code == 201
-    assert (await client.delete(_path(created_group))).status_code == 204
-    assert (await client.delete(_path(created_group))).status_code == 404
-    fetched = await client.get(_path(sibling.json()))
-    assert fetched.status_code == 200
-    assert_that(fetched.json(), equal_to(sibling.json()))
+    assert sibling.status == 201
+
+    # act
+    first = await client.delete(_path(created_group))
+    repeated = await client.delete(_path(created_group))
+    fetched = await client.get(_path(await sibling.json()))
+
+    # assert
+    assert first.status == 204
+    assert repeated.status == 404
+    assert fetched.status == 200
+    assert_that((await fetched.json()), equal_to(await sibling.json()))
 
 
-async def test_group_openapi_has_stable_operations_and_response_schemas(client: httpx.AsyncClient) -> None:
+async def test_group_openapi_has_stable_operations_and_response_schemas(client: aiohttp.ClientSession) -> None:
+    # act
     response = await client.get("/openapi.json")
-    assert response.status_code == 200
-    schema = response.json()
+
+    # assert
+    assert response.status == 200
+    schema = await response.json()
     collection = "/api/v1/users/{organizer_user_id}/groups"
     for method, path, operation_id, status_code in [
         ("post", collection, "create_group", "201"),

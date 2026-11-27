@@ -1,6 +1,8 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any, TypedDict
 
+import aiohttp
 from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
@@ -9,18 +11,49 @@ from secret_santa_backend.config import Settings
 from secret_santa_backend.repositories.postgres import PostgresDatabase, get_database, use_database
 from secret_santa_backend.services import register_user as register_user_service
 from secret_santa_backend.services.groups import GroupNotFoundError
+from secret_santa_backend.web.auth import BearerMiddleware, is_api_path
 from secret_santa_backend.web.entities import HealthResponse, UserRegistrationRequest, UserResponse
 from secret_santa_backend.web.groups import create_group_router
+
+
+class AppState(TypedDict):
+    database: PostgresDatabase
+    token_client: aiohttp.ClientSession
+
+
+class BackendAPI(FastAPI):
+    def openapi(self) -> dict[str, Any]:
+        if self.openapi_schema is not None:
+            return self.openapi_schema
+
+        schema = super().openapi()
+        schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
+        schemes["ServiceBearer"] = {"type": "http", "scheme": "bearer"}
+        for path, path_item in schema["paths"].items():
+            if not is_api_path(path):
+                continue
+            for operation in path_item.values():
+                if isinstance(operation, dict) and "responses" in operation:
+                    operation["security"] = [{"ServiceBearer": []}]
+                    operation["responses"]["401"] = {"description": "Invalid or missing bearer token"}
+                    operation["responses"]["503"] = {"description": "Token verification unavailable"}
+
+        return schema
 
 
 def create_app() -> FastAPI:
     settings = Settings.from_environment()
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[dict[str, PostgresDatabase]]:
+    async def lifespan(_: FastAPI) -> AsyncIterator[AppState]:
         database = PostgresDatabase(settings.database_url)
         try:
-            yield {"database": database}
+            async with aiohttp.ClientSession(
+                base_url=settings.issuer_url,
+                headers={"Authorization": aiohttp.encode_basic_auth("backend", settings.backend_secret)},
+                timeout=aiohttp.ClientTimeout(total=2),
+            ) as token_client:
+                yield {"database": database, "token_client": token_client}
         finally:
             await database.close()
 
@@ -30,7 +63,7 @@ def create_app() -> FastAPI:
         with use_database(database):
             yield
 
-    app = FastAPI(
+    app = BackendAPI(
         title="Secret Santa Backend",
         version="0.1.0",
         docs_url="/docs",
@@ -39,6 +72,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         dependencies=[Depends(bind_database)],
     )
+    app.add_middleware(BearerMiddleware)
     app.include_router(create_group_router())
 
     @app.exception_handler(GroupNotFoundError)
@@ -56,11 +90,15 @@ def create_app() -> FastAPI:
         response_model=HealthResponse,
         responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"model": HealthResponse}},
     )
-    async def get_readiness() -> HealthResponse | JSONResponse:
-        """Проверить готовность backend: при недоступной PostgreSQL вернуть 503."""
+    async def get_readiness(request: Request) -> HealthResponse | JSONResponse:
+        """Проверить доступность PostgreSQL и сервиса выдачи токенов."""
         try:
             ready = await get_database().is_ready()
-        except SQLAlchemyError:
+            if ready:
+                token_client: aiohttp.ClientSession = request.state.token_client
+                async with token_client.get("/health/ready", allow_redirects=False) as response:
+                    ready = response.status == status.HTTP_200_OK
+        except SQLAlchemyError, aiohttp.ClientError, TimeoutError:
             ready = False
 
         if not ready:
